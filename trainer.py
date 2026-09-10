@@ -1,10 +1,13 @@
-import argparse
+import contextlib
+import math
 import os
 from typing import Optional, Union
 
+import hydra
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+from omegaconf import DictConfig, OmegaConf
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
@@ -14,11 +17,16 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from flow_matching.path import AffineProbPath
 from flow_matching.path.scheduler import CondOTScheduler
 
-from utils.general_utils import create_dataloader, load_and_prepare_data, load_config
+from utils.callbacks import EMACallback
+from utils.config_schema import register_configs
+from utils.data_lazy import LazyPtDataset, resolve_split_files
+from utils.general_utils import create_dataloader, load_and_prepare_data
 from utils.motfm_logging import get_logger
 from utils.utils_fm import build_model, validate_and_save_samples
 
 logger = get_logger(__name__)
+
+register_configs()
 
 
 class FlowMatchingDataModule(pl.LightningDataModule):
@@ -29,11 +37,19 @@ class FlowMatchingDataModule(pl.LightningDataModule):
         self.config = config
         self.train_data: Optional[dict] = None
         self.val_data: Optional[dict] = None
+        # Lazy datasets (only populated when data_args.loader == "lazy_pt").
+        self._lazy_train_ds: Optional[LazyPtDataset] = None
+        self._lazy_val_ds: Optional[LazyPtDataset] = None
         model_config = self.config.get("model_args", {})
         self.mask_conditioning = bool(model_config.get("mask_conditioning", False))
         self.class_conditioning = bool(model_config.get("with_conditioning", False))
+        self.loader = str(self.config.get("data_args", {}).get("loader", "pickle"))
 
     def setup(self, stage: Optional[str] = None) -> None:
+        if self.loader == "lazy_pt":
+            self._setup_lazy(stage)
+            return
+
         data_config = self.config["data_args"]
         model_config = self.config.get("model_args", {})
         logger.info(
@@ -112,7 +128,72 @@ class FlowMatchingDataModule(pl.LightningDataModule):
             _assert_required_keys(self.val_data, split_name=data_config["split_val"])
             logger.info(f"Loaded validation split: val={int(self.val_data['images'].shape[0])}.")
 
+    def _make_lazy_dataset(self, split_key: str, default: str):
+        """Build (LazyPtDataset, meta-dict) for a split.
+
+        The meta-dict exposes empty tensors just so that ``.shape[0]`` and
+        ``class_map`` are available (the contract expected by ``trainer.py`` and
+        ``inferer.py``); the actual samples are read on demand.
+        """
+        dc = self.config["data_args"]
+        split = dc.get(split_key, default)
+        files, classes = resolve_split_files(dc["slice_index_csv"], dc["splits_csv"], split)
+        num_classes = int(self.config.get("model_args", {}).get("cross_attention_dim", 2) or 2)
+        ds = LazyPtDataset(
+            files,
+            classes,
+            dc["tensors_dir"],
+            mask_conditioning=self.mask_conditioning,
+            class_conditioning=self.class_conditioning,
+            num_classes=num_classes,
+            image_key=dc.get("image_key", "y"),
+            cond_key=dc.get("cond_key", "x"),
+            norm_scope=dc.get("norm_scope", "sample"),
+            eps=float(dc.get("norm_eps", 1e-6)),
+            modality_dropout=float(dc.get("modality_dropout", 0.0)),
+            split=split,
+        )
+        meta: dict = {
+            "images": torch.empty((len(ds), 0)),
+            "class_map": {i: i for i in range(num_classes)},
+        }
+        if self.mask_conditioning:
+            meta["masks"] = torch.empty((len(ds), 0))
+        if self.class_conditioning:
+            meta["classes"] = torch.empty((len(ds), 0))
+        return ds, meta
+
+    def _setup_lazy(self, stage: Optional[str] = None) -> None:
+        data_config = self.config["data_args"]
+        logger.info(
+            f"Setting up LAZY data module for stage='{stage}' from "
+            f"tensors_dir='{data_config['tensors_dir']}'."
+        )
+        if stage in (None, "fit"):
+            self._lazy_train_ds, self.train_data = self._make_lazy_dataset("split_train", "train")
+            self._lazy_val_ds, self.val_data = self._make_lazy_dataset("split_val", "val")
+        elif stage == "validate":
+            self._lazy_val_ds, self.val_data = self._make_lazy_dataset("split_val", "val")
+
+    def _lazy_dataloader(self, dataset: LazyPtDataset, shuffle: bool) -> torch.utils.data.DataLoader:
+        tr = self.config["train_args"]
+        num_workers = int(tr.get("num_workers", 0))
+        kwargs = dict(
+            batch_size=tr["batch_size"],
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=tr.get("pin_memory", torch.cuda.is_available()),
+            persistent_workers=(num_workers > 0),
+            drop_last=bool(tr.get("drop_last", False)) and shuffle,
+        )
+        if num_workers > 0:
+            kwargs["prefetch_factor"] = int(tr.get("prefetch_factor", 4) or 4)
+        return torch.utils.data.DataLoader(dataset, **kwargs)
+
     def train_dataloader(self) -> torch.utils.data.DataLoader:
+        if self.loader == "lazy_pt":
+            return self._lazy_dataloader(self._lazy_train_ds, shuffle=True)
+
         tr_args = self.config["train_args"]
         sampler = None
         shuffle = True
@@ -166,6 +247,9 @@ class FlowMatchingDataModule(pl.LightningDataModule):
         )
 
     def val_dataloader(self) -> torch.utils.data.DataLoader:
+        if self.loader == "lazy_pt":
+            return self._lazy_dataloader(self._lazy_val_ds, shuffle=False)
+
         tr_args = self.config["train_args"]
         return create_dataloader(
             Images=self.val_data["images"],
@@ -233,9 +317,43 @@ class FlowMatchingLightningModule(pl.LightningModule):
         loss = self._compute_loss(batch)
         self.log("val/loss", loss, prog_bar=True, on_epoch=True)
 
-    def configure_optimizers(self) -> optim.Optimizer:
-        lr = self.hparams["train_args"]["lr"]
-        return optim.Adam(self.model.parameters(), lr=lr)
+    def configure_optimizers(self):
+        ta = self.hparams["train_args"]
+        lr = ta["lr"]
+        weight_decay = float(ta.get("weight_decay", 0.0))
+        optimizer_name = str(ta.get("optimizer", "adam")).lower()
+
+        if optimizer_name == "adamw":
+            opt = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        else:
+            opt = optim.Adam(self.model.parameters(), lr=lr)
+
+        if str(ta.get("scheduler", "none")).lower() != "cosine":
+            return opt
+
+        # Cosine decay with linear warmup, stepped per optimizer step.
+        try:
+            total = int(self.trainer.estimated_stepping_batches)
+        except Exception:
+            total = 0
+        if total <= 1:
+            return opt
+
+        warmup = ta.get("warmup_steps", None)
+        if warmup is None:
+            warmup = max(1, int(0.03 * total))
+        warmup = min(int(warmup), max(1, total - 1))
+        floor = float(ta.get("min_lr_ratio", 0.05))
+
+        def _lr_lambda(step: int) -> float:
+            if step < warmup:
+                return step / max(1, warmup)
+            progress = (step - warmup) / max(1, total - warmup)
+            progress = min(1.0, max(0.0, progress))
+            return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = optim.lr_scheduler.LambdaLR(opt, _lr_lambda)
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
 
     def on_validation_epoch_end(self) -> None:
         """Run sampling/visualization at epoch end similar to utils.validate_and_save_samples."""
@@ -259,20 +377,31 @@ class FlowMatchingLightningModule(pl.LightningModule):
         # Get a fresh val dataloader
         val_loader = self.trainer.datamodule.val_dataloader()
 
-        # Execute the validation sampling and saving
+        # Execute the validation sampling and saving.
+        # This hook runs OUTSIDE Lightning's autocast, so under mixed precision the
+        # (fp16/bf16) params would clash with fp32 inputs inside the ControlNet.
+        # Wrap the sampling in autocast to match the trainer precision.
         logger.info(f"Running validation sample export for epoch {self.current_epoch}.")
-        validate_and_save_samples(
-            model=self.model,
-            val_loader=val_loader,
-            device=self.device,
-            checkpoint_dir=log_dir,
-            epoch=self.current_epoch,
-            solver_config=solver_args,
-            max_samples=tr.get("num_val_samples", 16),
-            class_map=None,
-            mask_conditioning=self.mask_conditioning,
-            class_conditioning=self.class_conditioning,
-        )
+        precision = str(getattr(self.trainer, "precision", "32-true"))
+        if "16" in precision and self.device.type == "cuda":
+            amp_dtype = torch.bfloat16 if "bf16" in precision else torch.float16
+            amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype)
+        else:
+            amp_ctx = contextlib.nullcontext()
+
+        with amp_ctx:
+            validate_and_save_samples(
+                model=self.model,
+                val_loader=val_loader,
+                device=self.device,
+                checkpoint_dir=log_dir,
+                epoch=self.current_epoch,
+                solver_config=solver_args,
+                max_samples=tr.get("num_val_samples", 16),
+                class_map=None,
+                mask_conditioning=self.mask_conditioning,
+                class_conditioning=self.class_conditioning,
+            )
 
 
 def _resolve_resume_checkpoint(
@@ -339,23 +468,26 @@ def _resolve_strategy(
     return "auto"
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train the flow matching model with Lightning.")
-    parser.add_argument(
-        "--config_path",
-        type=str,
-        default="configs/default.yaml",
-        help="Path to the configuration file.",
-    )
-    args = parser.parse_args()
+@hydra.main(version_base=None, config_path="conf", config_name="config")
+def main(cfg: DictConfig) -> None:
+    # Resolve to a plain container so no OmegaConf types leak into torch/Lightning.
+    config = OmegaConf.to_container(cfg, resolve=True)
 
-    config = load_config(args.config_path)
-    run_name = os.path.splitext(os.path.basename(args.config_path))[0]
+    run_name = str(config.get("run_name", "default"))
     tr = config["train_args"]
     root_ckpt_dir = tr["checkpoint_dir"]
-    logger.info(f"Loaded training config: {args.config_path}")
+    logger.info("Resolved config:\n" + OmegaConf.to_yaml(cfg))
     logger.info(f"Run name: {run_name}")
     logger.info(f"Checkpoint root directory: {root_ckpt_dir}")
+
+    # Optional TF32 for faster matmuls on Ampere+ GPUs.
+    matmul_precision = tr.get("matmul_precision", None)
+    if matmul_precision:
+        try:
+            torch.set_float32_matmul_precision(str(matmul_precision))
+            logger.info(f"Set float32 matmul precision='{matmul_precision}' (TF32).")
+        except Exception as exc:
+            logger.warning(f"Could not set matmul precision: {exc}")
 
     seed = tr.get("seed")
     if seed is not None:
@@ -366,6 +498,14 @@ def main() -> None:
     # Data and model modules
     datamodule = FlowMatchingDataModule(config)
     model = FlowMatchingLightningModule(config)
+
+    # Optional model compilation.
+    if bool(tr.get("use_compile", False)):
+        try:
+            model = torch.compile(model)
+            logger.info("torch.compile enabled.")
+        except Exception as exc:
+            logger.warning(f"torch.compile unavailable ({exc}); continuing without.")
 
     # Logging and callbacks
     tb_logger = TensorBoardLogger(save_dir=root_ckpt_dir, name=run_name)
@@ -382,6 +522,9 @@ def main() -> None:
     )
     lr_cb = LearningRateMonitor(logging_interval="step")
     cbs = [ckpt_cb, lr_cb]
+    if bool(tr.get("use_ema", False)):
+        cbs.append(EMACallback(decay=float(tr.get("ema_decay", 0.999))))
+        logger.info(f"EMA enabled (decay={tr.get('ema_decay', 0.999)}).")
 
     # Precision setup with safe bf16/fp16 detection
     _bf16_supported = (
@@ -391,7 +534,7 @@ def main() -> None:
     default_precision = (
         "bf16-mixed" if _bf16_supported else ("16-mixed" if _fp16_supported else "32-true")
     )
-    precision = tr.get("precision", default_precision)
+    precision = tr.get("precision") or default_precision
 
     resume_ckpt = _resolve_resume_checkpoint(tr.get("ckpt_path"), root_ckpt_dir, run_name)
     if resume_ckpt:
@@ -401,7 +544,13 @@ def main() -> None:
 
     accelerator = tr.get("accelerator", "auto")
     devices = tr.get("devices", "auto")
-    strategy = _resolve_strategy(accelerator=accelerator, devices=devices)
+    # Allow an explicit strategy override from config (e.g. "dp"/"ddp"); otherwise
+    # only use DDP for true multi-GPU execution.
+    strategy_cfg = tr.get("strategy", None)
+    if strategy_cfg is not None:
+        strategy = strategy_cfg
+    else:
+        strategy = _resolve_strategy(accelerator=accelerator, devices=devices)
     deterministic = bool(tr.get("deterministic", False))
     logger.info(
         f"Trainer runtime: accelerator={accelerator}, devices={devices}, "
@@ -425,6 +574,7 @@ def main() -> None:
         deterministic=deterministic,
         log_every_n_steps=tr.get("log_every_n_steps", 50),
         num_sanity_val_steps=tr.get("num_sanity_val_steps", 0),
+        limit_val_batches=tr.get("limit_val_batches", 1.0),
     )
 
     trainer.fit(model, datamodule=datamodule, ckpt_path=resume_ckpt)

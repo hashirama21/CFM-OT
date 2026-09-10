@@ -1,0 +1,38 @@
+# @package _global_
+# synT1CE: predict contrast-enhanced T1CE from non-contrast modalities on BraTS.
+# ControlNet input x = [T1n, T2w, T2f] (3 channels), target y = T1CE (1 channel),
+# class = has_tumour (0/1). Reduced backbone (~47M) for 2xT4. Lazy .pt loader
+# with modality-dropout for robustness to missing input modalities.
+defaults:
+  - override /model@model_args: unet2d
+  - override /conditioning@model_args: mask_class
+  - override /data@data_args: lazy_pt
+  - override /train@train_args: kaggle_2xt4
+  - override /solver@solver_args: default
+
+run_name: brats_synt1ce
+
+model_args:
+  transformer_num_layers: 2
+  num_res_blocks: [2, 2, 2, 1, 1]
+  use_flash_attention: false
+  cross_attention_dim: 2               # has_tumour {0, 1}
+  conditioning_embedding_in_channels: 3  # 3 input modalities
+  conditioning_embedding_num_channels: [16]
+
+data_args:
+  tensors_dir: ${oc.env:MOTFM_TENSORS_DIR,./data/BraTS_2D_Tensors}
+  slice_index_csv: ${data_args.tensors_dir}/slice_index.csv
+  splits_csv: ${data_args.tensors_dir}/splits.csv
+  split_train: train
+  split_val: val
+  split_test: test
+  image_key: y
+  cond_key: x
+  norm_scope: sample
+  modality_dropout: 0.5
+  class_values: [0, 1]
+
+solver_args:
+  method: midpoint
+  time_points: 10

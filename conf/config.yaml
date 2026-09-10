@@ -1,0 +1,24 @@
+# MOTFM — Hydra entry config.
+# Compose via config groups and override on the CLI, e.g.
+#   python trainer.py experiment=brats_synt1ce train_args.lr=2e-4
+#   python trainer.py model@model_args=unet3d conditioning@model_args=unconditional
+# Inspect the resolved config without running:
+#   python trainer.py --cfg job experiment=brats_synt1ce
+defaults:
+  - base_config
+  - model@model_args: unet2d
+  - conditioning@model_args: mask_class
+  - data@data_args: pickle
+  - train@train_args: default
+  - solver@solver_args: default
+  - infer@infer_args: default
+  - experiment: null
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${train_args.checkpoint_dir}/hydra/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ${train_args.checkpoint_dir}/hydra/multirun/${now:%Y-%m-%d_%H-%M-%S}

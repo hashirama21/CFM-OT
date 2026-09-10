@@ -489,11 +489,14 @@ def save_image(img_tensor, out_path):
     Saves a single 2D image (assumed shape [1, H, W] or [H, W]) as PNG.
     """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    # remove batch/channel dims if present
-    if img_tensor.dim() == 3 and img_tensor.shape[0] == 1:
-        img_tensor = img_tensor.squeeze(0)
+    # Collapse any leading batch/channel dims down to 2D (handles [1, H, W] as
+    # well as a multi-channel conditioning image such as [3, H, W]).
+    arr = img_tensor.detach().cpu().numpy() if hasattr(img_tensor, "detach") else np.asarray(img_tensor)
+    arr = np.asarray(arr)
+    while arr.ndim > 2:
+        arr = arr[0]
     plt.figure()
-    plt.imshow(img_tensor.cpu().numpy(), cmap="gray")
+    plt.imshow(arr, cmap="gray")
     plt.axis("off")
     plt.savefig(out_path, bbox_inches="tight", pad_inches=0)
     plt.close()

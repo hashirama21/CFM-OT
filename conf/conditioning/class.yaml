@@ -1,0 +1,6 @@
+# Overlay merged into model_args. Class-conditional (cross-attention) generation.
+with_conditioning: true
+mask_conditioning: false
+cross_attention_dim: 4  # number of classes
+conditioning_embedding_num_channels: null
+conditioning_embedding_in_channels: null

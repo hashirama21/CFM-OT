@@ -1,0 +1,35 @@
+# @package _global_
+# Reproduces the historical configs/config_3D.yaml (3D brain MRI, unconditional).
+defaults:
+  - override /model@model_args: unet3d
+  - override /conditioning@model_args: unconditional
+  - override /data@data_args: pickle
+  - override /train@train_args: default
+  - override /solver@solver_args: default
+
+run_name: mri3d_uncond
+
+data_args:
+  pickle_path: ./data/mri.pkl
+  split_train: train
+  split_val: valid
+  # MRI intensities vary across volumes; keep [-1, 1] if already normalized,
+  # otherwise normalize each volume independently into that range.
+  image_norm:
+    mode: auto
+    scope: sample
+    range: [-1.0, 1.0]
+
+train_args:
+  num_epochs: 100
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  lr: 1e-4
+  val_freq: 5
+  num_val_samples: 4
+  seed: 42
+  accelerator: auto
+  devices: auto
+  num_workers: 4
+  log_every_n_steps: 10
+  checkpoint_dir: unconditional_checkpoints_3d_mri

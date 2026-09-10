@@ -1,0 +1,23 @@
+# @package _global_
+# Reproduces the historical configs/default.yaml (CAMUS, mask+class, pickle).
+defaults:
+  - override /model@model_args: unet2d
+  - override /conditioning@model_args: mask_class
+  - override /data@data_args: pickle
+  - override /train@train_args: default
+  - override /solver@solver_args: default
+
+run_name: camus_mask_class
+
+data_args:
+  pickle_path: ./data/camus/dataset.pkl
+  split_train: train
+  split_val: valid
+
+train_args:
+  num_epochs: 200
+  batch_size: 1
+  lr: 1e-4
+  val_freq: 1
+  num_val_samples: 10
+  checkpoint_dir: mask_class_conditioning_checkpoints

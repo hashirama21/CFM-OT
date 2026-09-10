@@ -1,4 +1,3 @@
-import argparse
 import os
 import warnings
 import pickle
@@ -11,15 +10,20 @@ import numpy as np
 # Suppress most warnings for cleaner logs (comment out if debugging is needed)
 warnings.filterwarnings("ignore")
 
+import hydra
 import torch
+from omegaconf import DictConfig, OmegaConf
 
-from utils.general_utils import class_label_from_map, load_config, set_global_seed
+from utils.config_schema import register_configs
+from utils.general_utils import class_label_from_map, set_global_seed
 from utils.motfm_logging import get_logger
 from utils.utils_fm import sample_batch
 
 from trainer import FlowMatchingDataModule, FlowMatchingLightningModule
 
 logger = get_logger(__name__)
+
+register_configs()
 
 
 def _select_checkpoint_file(ckpt_dir: str) -> Optional[str]:
@@ -64,7 +68,7 @@ def _resolve_checkpoint_candidate(path: str) -> Optional[Tuple[str, str]]:
 
 
 def resolve_checkpoint_path(
-    model_path: Optional[str], config: Dict, config_path: str
+    model_path: Optional[str], config: Dict, run_name: str
 ) -> Tuple[str, str]:
     """
     Resolve checkpoint from a checkpoint directory.
@@ -73,7 +77,6 @@ def resolve_checkpoint_path(
         checkpoint_path (str): absolute path to the checkpoint file.
         checkpoint_dir (str): directory containing the checkpoint.
     """
-    run_name = os.path.splitext(os.path.basename(config_path))[0]
     root_dir = config["train_args"]["checkpoint_dir"]
 
     candidate_paths = (
@@ -199,7 +202,13 @@ def load_model_from_checkpoint(
         allow_mismatch=allow_config_mismatch,
     )
     lightning_module = FlowMatchingLightningModule(config)
-    lightning_module.load_state_dict(checkpoint["state_dict"], strict=True)
+    state_dict = checkpoint["state_dict"]
+    # A checkpoint saved from a torch.compile'd module has keys prefixed with
+    # "_orig_mod."; strip it so the state dict maps onto the plain module.
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+        logger.info("Stripped torch.compile '_orig_mod.' prefix from checkpoint keys.")
+    lightning_module.load_state_dict(state_dict, strict=True)
     model = lightning_module.model.to(device)
     model.eval()
     metadata = {
@@ -222,88 +231,24 @@ def build_solver_config(config: Dict, num_inference_steps: Optional[int]) -> Dic
     return solver_config
 
 
-def main():
-    # Parse arguments
-    parser = argparse.ArgumentParser(description="Inference script for the flow matching model.")
-    parser.add_argument(
-        "--config_path",
-        type=str,
-        default="configs/default.yaml",
-        help="Path to the configuration file.",
-    )
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=None,
-        help="Number of samples to save. If omitted, all validation samples are saved.",
-    )
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        default=None,
-        help=(
-            "Path to a checkpoint directory. If omitted, "
-            "`train_args.checkpoint_dir/<config_basename>` is used."
-        ),
-    )
-    parser.add_argument(
-        "--num_inference_steps",
-        type=int,
-        default=None,
-        help=(
-            "Number of inference steps during sampling. "
-            "If omitted, uses `solver_args.time_points` from the config."
-        ),
-    )
-    parser.add_argument(
-        "--output_path",
-        type=str,
-        default=None,
-        help=(
-            "Output .pkl path. If omitted, a name derived from config/checkpoint/steps is used in "
-            "the checkpoint directory."
-        ),
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite --output_path if it already exists.",
-    )
-    parser.add_argument(
-        "--output_norm",
-        type=str,
-        default="per_sample_minmax",
-        choices=["clip_0_1", "per_sample_minmax", "global_minmax", "none"],
-        help=(
-            "Normalization applied to generated images before saving. "
-            "`per_sample_minmax` matches training-time validation visualizations."
-        ),
-    )
-    parser.add_argument(
-        "--allow_config_mismatch",
-        action="store_true",
-        help="Allow loading a checkpoint whose saved config mismatches the current config.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help=(
-            "Random seed for reproducible sampling. "
-            "If omitted, uses `train_args.seed` from config when available."
-        ),
-    )
+@hydra.main(version_base=None, config_path="conf", config_name="config")
+def main(cfg: DictConfig) -> None:
+    # Resolve to a plain container so no OmegaConf types leak downstream.
+    config = OmegaConf.to_container(cfg, resolve=True)
+    infer = config.get("infer_args", {}) or {}
+    run_name = str(config.get("run_name", "default"))
+    logger.info("Resolved config:\n" + OmegaConf.to_yaml(cfg))
 
-    args = parser.parse_args()
-
-    # Load config and determine checkpoint path
-    config_path = args.config_path
-    logger.info(f"Loading config from: {config_path}")
-    config = load_config(config_path)
-    checkpoint_path, checkpoint_dir = resolve_checkpoint_path(args.model_path, config, config_path)
+    # Determine checkpoint path
+    checkpoint_path, checkpoint_dir = resolve_checkpoint_path(
+        infer.get("model_path"), config, run_name
+    )
     logger.info(f"Using checkpoint: {checkpoint_path}")
 
-    seed = args.seed
+    # Seed: explicit infer_args.seed, else fall back to train_args.seed.
+    seed = infer.get("seed")
+    if seed is None:
+        seed = config.get("train_args", {}).get("seed")
     if seed is not None:
         seed = int(seed)
         set_global_seed(seed)
@@ -323,17 +268,17 @@ def main():
         checkpoint_path=checkpoint_path,
         config=config,
         device=device,
-        allow_config_mismatch=args.allow_config_mismatch,
+        allow_config_mismatch=bool(infer.get("allow_config_mismatch", False)),
     )
     logger.info(
         f"Checkpoint metadata: epoch={metadata['epoch']}, global_step={metadata['global_step']}"
     )
 
-    solver_config = build_solver_config(config, args.num_inference_steps)
+    solver_config = build_solver_config(config, infer.get("num_inference_steps"))
 
-    config_name = os.path.splitext(os.path.basename(config_path))[0]
+    config_name = run_name
     ckpt_name = metadata["checkpoint_name"]
-    output_path = args.output_path
+    output_path = infer.get("output_path")
     if output_path is None:
         output_path = os.path.join(
             checkpoint_dir,
@@ -344,7 +289,7 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     if os.path.exists(output_path):
-        if args.overwrite:
+        if bool(infer.get("overwrite", False)):
             logger.info(f"Overwriting existing output file: {output_path}")
         else:
             base, ext = os.path.splitext(output_path)
@@ -352,7 +297,7 @@ def main():
             ext = ext or ".pkl"
             output_path = f"{base}_{timestamp}{ext}"
             logger.warning(
-                "Output file already exists and --overwrite was not set. "
+                "Output file already exists and infer_args.overwrite is false. "
                 f"Writing to: {output_path}"
             )
 
@@ -369,7 +314,7 @@ def main():
 
     # Determine the number of samples to infer
     dataset_size = len(val_loader.dataset)
-    num_samples = dataset_size if args.num_samples is None else args.num_samples
+    num_samples = dataset_size if infer.get("num_samples") is None else int(infer["num_samples"])
     logger.info(f"Number of samples to save: {num_samples}")
 
     logger.info(
@@ -474,10 +419,11 @@ def main():
     average_time_per_sample = total_time / samples_collected
     logger.info(f"Average time per sample: {average_time_per_sample:.4f} seconds")
 
+    output_norm = str(infer.get("output_norm", "per_sample_minmax"))
     logger.info(f"Raw generated range: [{float(raw_global_min):.6f}, {float(raw_global_max):.6f}]")
-    logger.info(f"Applying output normalization mode: {args.output_norm}")
+    logger.info(f"Applying output normalization mode: {output_norm}")
 
-    if args.output_norm == "global_minmax":
+    if output_norm == "global_minmax":
         if raw_global_max > raw_global_min:
             offset = raw_global_min
             scale = raw_global_max - raw_global_min
@@ -494,7 +440,7 @@ def main():
                 sample["image"] = np.zeros_like(sample["image"], dtype=np.float32)
     else:
         for sample in generated_samples:
-            sample["image"] = _normalize_sample_image(sample["image"], args.output_norm)
+            sample["image"] = _normalize_sample_image(sample["image"], output_norm)
 
     # Mirror generated samples under configured split keys for downstream loader compatibility.
     generated_dataset = {split_train_key: generated_samples}

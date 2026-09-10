@@ -1,0 +1,6 @@
+# Overlay merged into model_args. Mask (ControlNet) + class (cross-attention).
+with_conditioning: true
+mask_conditioning: true
+cross_attention_dim: 4  # number of classes
+conditioning_embedding_num_channels: [16]
+conditioning_embedding_in_channels: 1  # channels of the conditioning image

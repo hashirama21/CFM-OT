@@ -1,0 +1,4 @@
+# ODE solver used for flow-matching sampling (validation + inference).
+method: euler
+step_size: 0.1
+time_points: 10

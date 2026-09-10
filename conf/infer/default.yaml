@@ -1,0 +1,9 @@
+# Inference-only knobs (used by inferer.py).
+num_samples: null            # null -> all validation/test samples
+model_path: null             # checkpoint file or directory (null -> auto-resolve)
+num_inference_steps: null    # null -> use solver_args.time_points
+output_path: null            # null -> derived name in the checkpoint directory
+overwrite: false
+output_norm: per_sample_minmax  # clip_0_1|per_sample_minmax|global_minmax|none
+allow_config_mismatch: false
+seed: null

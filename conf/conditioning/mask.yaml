@@ -1,0 +1,6 @@
+# Overlay merged into model_args. Mask-conditional (ControlNet) generation.
+with_conditioning: false
+mask_conditioning: true
+cross_attention_dim: null
+conditioning_embedding_num_channels: [16]
+conditioning_embedding_in_channels: 1  # channels of the conditioning image

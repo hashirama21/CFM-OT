@@ -1,0 +1,6 @@
+# Overlay merged into model_args. Free (unconditional) generation.
+with_conditioning: false
+mask_conditioning: false
+cross_attention_dim: null
+conditioning_embedding_num_channels: null
+conditioning_embedding_in_channels: null

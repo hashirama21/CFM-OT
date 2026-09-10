@@ -1,0 +1,12 @@
+# 3D backbone (e.g. brain MRI volumes).
+spatial_dims: 3
+in_channels: 1
+out_channels: 1
+num_res_blocks: [2, 2, 2, 2]
+num_channels: [32, 64, 160, 480]
+attention_levels: [false, false, false, true]
+norm_num_groups: 32
+resblock_updown: true
+num_head_channels: [32, 64, 160, 480]
+transformer_num_layers: 6
+use_flash_attention: true

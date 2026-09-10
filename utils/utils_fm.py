@@ -4,6 +4,7 @@ import json
 import torch
 import matplotlib.pyplot as plt
 from torch import nn
+from omegaconf import DictConfig, OmegaConf
 from generative.networks.nets import DiffusionModelUNet, ControlNet
 from flow_matching.solver import ODESolver
 
@@ -68,7 +69,11 @@ class MergedModel(nn.Module):
                 raise KeyError(
                     "mask_conditioning is enabled but no `masks` were provided in the batch."
                 )
-            # cond is expected to be a ControlNet conditioning, e.g. mask
+            # cond is expected to be a ControlNet conditioning, e.g. mask.
+            # Cast the conditioning image to the ControlNet's parameter dtype so
+            # the forward stays valid even when called outside Lightning autocast
+            # (e.g. fp16 params vs fp32 masks -> Linear dtype mismatch).
+            masks = masks.to(dtype=next(self.controlnet.parameters()).dtype)
             down_block_res_samples, mid_block_res_sample = self.controlnet(
                 x=x, timesteps=t, controlnet_cond=masks, context=cond
             )
@@ -101,14 +106,22 @@ def build_model(model_config: dict, device: torch.device = None) -> MergedModel:
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Make a copy so the original config remains unaltered.
-    mc = model_config.copy()
+    # Make a plain-dict copy so the original config remains unaltered and no
+    # OmegaConf container types leak into the MONAI constructors.
+    if isinstance(model_config, DictConfig):
+        mc = OmegaConf.to_container(model_config, resolve=True)
+    else:
+        mc = dict(model_config)
 
     # Pop out keys that are not needed by the model constructors.
     mask_conditioning = mc.pop("mask_conditioning", False)
     max_timestep = mc.pop("max_timestep", 1000)
-    # Pop out ControlNet specific key, if present.
+    # Pop out ControlNet-specific keys, if present.
     cond_embed_channels = mc.pop("conditioning_embedding_num_channels", None)
+    cond_in_channels = mc.pop("conditioning_embedding_in_channels", None)
+    # Drop optional keys left at None so the UNet constructor keeps its defaults.
+    if mc.get("dropout_cattn", "unset") is None:
+        mc.pop("dropout_cattn", None)
 
     # Build the base UNet by passing all remaining items as kwargs.
     unet = DiffusionModelUNet(**mc)
@@ -116,11 +129,19 @@ def build_model(model_config: dict, device: torch.device = None) -> MergedModel:
     controlnet = None
     if mask_conditioning:
         mc.pop("out_channels", None)
-        # Ensure the controlnet has its specific key.
+        # Ensure the controlnet has its specific keys.
         if cond_embed_channels is None:
             cond_embed_channels = (16,)
-        # Pass the same config kwargs to ControlNet plus the controlnet-specific key.
-        controlnet = ControlNet(**mc, conditioning_embedding_num_channels=cond_embed_channels)
+        if cond_in_channels is None:
+            cond_in_channels = 1
+        # Pass the same config kwargs to ControlNet plus the controlnet-specific keys.
+        # `conditioning_embedding_in_channels` sets the number of channels of the
+        # conditioning image (1 for a binary mask, 3 for synT1CE multi-modality input).
+        controlnet = ControlNet(
+            **mc,
+            conditioning_embedding_num_channels=cond_embed_channels,
+            conditioning_embedding_in_channels=cond_in_channels,
+        )
         # Start ControlNet close to the UNet initialization for stabler joint optimization.
         controlnet.load_state_dict(unet.state_dict(), strict=False)
 
@@ -198,7 +219,13 @@ def plot_solver_steps(sol, im_batch, mask_batch, class_batch, class_map, outdir,
                 axes[i][t].set_title(f"Step {t}")
         col = n_steps
         if mask_batch is not None:
-            axes[i][col].imshow(mask_batch[i].cpu().numpy().squeeze(), cmap="gray")
+            # Collapse any leading batch/channel dims (e.g. a 3-channel conditioning
+            # image) down to 2D; a bare .squeeze() would leave (3, H, W) which
+            # imshow rejects.
+            _m = mask_batch[i].detach().cpu().numpy()
+            while _m.ndim > 2:
+                _m = _m[0]
+            axes[i][col].imshow(_m, cmap="gray")
             axes[i][col].axis("off")
             if i == 0:
                 axes[i][col].set_title("Mask")

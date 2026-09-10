@@ -30,6 +30,7 @@
   - `pytorch-lightning==2.5.6`
   - `numpy==1.26.4`
   - `monai_generative==0.2.3`
+  - `hydra-core` + `omegaconf` (configuration)
 
 To install from `pyproject.toml`, run:
 ```bash
@@ -83,9 +84,52 @@ Make sure your dataset adheres to the described data structure, saved in a singl
 
 ---
 
-## Configuration Files
+## Configuration (Hydra)
 
-You must **either create** or **modify** a YAML configuration file to suit your dataset paths, model parameters, and hyperparameters. Some sample configuration files are provided in the `configs/` folder. By default, `configs/default.yaml` is used if no custom path is provided.
+Configuration is managed with **[Hydra](https://hydra.cc) + OmegaConf**. The config
+tree lives in `conf/` and is composed from independent groups:
+
+```
+conf/
+  config.yaml            # defaults list (which group option to load)
+  model/                 # unet2d | unet3d          -> model_args
+  conditioning/          # unconditional | class | mask | mask_class (overlays model_args)
+  data/                  # pickle | lazy_pt          -> data_args
+  train/                 # default | kaggle_2xt4     -> train_args
+  solver/                # default                   -> solver_args
+  infer/                 # default                   -> infer_args
+  experiment/            # ready-made compositions (camus_mask_class, mri3d_uncond, brats_synt1ce)
+```
+
+The typed schema is defined in `utils/config_schema.py` (registered with Hydra's
+`ConfigStore`), so unknown keys and wrong types are caught at composition time.
+
+Pick a ready-made experiment or compose groups, and override any field on the CLI
+using dotted paths:
+
+```bash
+# Inspect the fully composed config WITHOUT running anything:
+python trainer.py --cfg job experiment=brats_synt1ce
+
+# Compose groups explicitly:
+python trainer.py model@model_args=unet3d conditioning@model_args=unconditional data@data_args=pickle
+
+# Override individual fields:
+python trainer.py experiment=camus_mask_class train_args.lr=2e-4 train_args.num_epochs=300
+```
+
+Available experiments:
+
+| Experiment | Setup |
+| --- | --- |
+| `camus_mask_class` | 2D CAMUS, mask+class conditioning, `pickle` loader (reproduces the historical `default`) |
+| `mri3d_uncond` | 3D brain MRI, unconditional, `pickle` loader |
+| `brats_synt1ce` | 2D BraTS synT1CE, ControlNet 3-channel input + class, `lazy_pt` loader, EMA/AdamW/cosine/fp16 |
+
+Two dataset loaders are supported via `data_args.loader`:
+- **`pickle`** — the single `.pkl` format described above.
+- **`lazy_pt`** — reads one `.pt` per sample on demand (no giant pickle in RAM),
+  indexed by `slice_index_csv` + `splits_csv`; supports `modality_dropout`.
 
 ---
 
@@ -93,16 +137,17 @@ You must **either create** or **modify** a YAML configuration file to suit your 
 
 To train the model, run:
 ```bash
-python trainer.py --config_path configs/default.yaml
+python trainer.py experiment=camus_mask_class
 ```
 or (after installation):
 ```bash
-motfm-train --config_path configs/default.yaml
+motfm-train experiment=camus_mask_class
 ```
 
-- `--config_path`: Path to your YAML configuration file. Defaults to `configs/default.yaml` if not provided.
-
-**Note**: Make sure you have prepared your dataset (as a single `.pkl` file) and configuration file properly before starting training.
+**Note**: Make sure you have prepared your dataset (a single `.pkl` file for the
+`pickle` loader, or the `.pt` tensors + CSVs for the `lazy_pt` loader) before
+starting training. Checkpoints and TensorBoard logs are written under
+`train_args.checkpoint_dir/<run_name>`.
 
 ---
 
@@ -112,41 +157,39 @@ Use `inferer.py` to generate synthetic samples from a trained checkpoint and sav
 
 ### Quick start
 
-Run with your config and checkpoint directory:
+Reuse the same experiment/config used for training, plus the `infer_args` group:
 ```bash
-python inferer.py \
-    --config_path configs/default.yaml \
-    --model_path mask_class_conditioning_checkpoints/default \
-    --num_samples 200
+python inferer.py experiment=camus_mask_class \
+    infer_args.model_path=mask_class_conditioning_checkpoints/camus_mask_class \
+    infer_args.num_samples=200
 ```
 or (after installation):
 ```bash
-motfm-infer \
-    --config_path configs/default.yaml \
-    --model_path mask_class_conditioning_checkpoints/default \
-    --num_samples 200
+motfm-infer experiment=camus_mask_class infer_args.num_samples=200
 ```
 
-### Arguments
+### `infer_args`
 
-- **`--config_path`** (`str`, default: `configs/default.yaml`): Config file used for model/data setup.
-- **`--model_path`** (`str`, optional): Checkpoint `.ckpt` file or directory.
-- **`--num_samples`** (`int`, optional): Number of samples to save. If omitted, saves all validation samples.
-- **`--num_inference_steps`** (`int`, optional): Number of solver time points used during sampling. If omitted, uses `solver_args.time_points` from the config.
-- **`--output_path`** (`str`, optional): Explicit output `.pkl` path.
-- **`--overwrite`** (`flag`): Overwrite an existing file at `--output_path`.
-- **`--output_norm`** (`str`, default: `per_sample_minmax`): One of `clip_0_1`, `per_sample_minmax`, `global_minmax`, `none`.
-- **`--allow_config_mismatch`** (`flag`): Allow loading a checkpoint whose saved critical model fields differ from current config.
-- **`--seed`** (`int`, optional): Override RNG seed for reproducible inference. Defaults to `train_args.seed` if provided.
+- **`model_path`** (optional): Checkpoint `.ckpt` file or directory. If omitted, resolves from `train_args.checkpoint_dir/<run_name>`.
+- **`num_samples`** (optional): Number of samples to save. If omitted, saves all validation samples.
+- **`num_inference_steps`** (optional): Number of solver time points used during sampling. If omitted, uses `solver_args.time_points`.
+- **`output_path`** (optional): Explicit output `.pkl` path.
+- **`overwrite`** (bool): Overwrite an existing file at `output_path`.
+- **`output_norm`** (default: `per_sample_minmax`): One of `clip_0_1`, `per_sample_minmax`, `global_minmax`, `none`.
+- **`allow_config_mismatch`** (bool): Allow loading a checkpoint whose saved critical model fields differ from the current config.
+- **`seed`** (optional): RNG seed for reproducible inference. Defaults to `train_args.seed`.
+
+Checkpoints saved from a `torch.compile`'d model (keys prefixed with `_orig_mod.`)
+are handled automatically.
 
 ### Checkpoint resolution behavior
 
-If `--model_path` is omitted, inferer searches:
-- `train_args.checkpoint_dir/<config_basename>`
+If `infer_args.model_path` is omitted, inferer searches:
+- `train_args.checkpoint_dir/<run_name>`
 
-If `--model_path` is provided, inferer checks (in order):
+If `infer_args.model_path` is provided, inferer checks (in order):
 - `<model_path>`
-- `<model_path>/<config_basename>`
+- `<model_path>/<run_name>`
 - `<model_path>/latest`
 
 If a directory is selected, checkpoint preference is:
@@ -155,17 +198,28 @@ If a directory is selected, checkpoint preference is:
 
 ### Output behavior
 
-- If `--output_path` is omitted, output is saved in the resolved checkpoint directory as:
-  - `samples_<config_basename>_<checkpoint_name>_steps<time_points>.pkl`
-- If output file exists and `--overwrite` is not set, a timestamp suffix is appended automatically.
+- If `infer_args.output_path` is omitted, output is saved in the resolved checkpoint directory as:
+  - `samples_<run_name>_<checkpoint_name>_steps<time_points>.pkl`
+- If output file exists and `infer_args.overwrite` is false, a timestamp suffix is appended automatically.
 - Generated samples are produced from the validation split and saved under:
   - `data_args.split_train`
   - and also `data_args.split_val` if that key is different.
 
 ### CPU-only note
 
-If you run inference on CPU, set `model_args.use_flash_attention: false` in your config.  
+If you run inference on CPU, set `model_args.use_flash_attention=false`.
 Flash attention requires CUDA and will raise an error otherwise.
+
+### Kaggle / Colab environment notes
+
+On managed notebook environments you may hit dependency ABI issues unrelated to
+MOTFM itself. Fix them *before* importing the code:
+- **`torchvision::nms` mismatch** — reinstall the `torchvision` matching your
+  `torch` with `pip install --no-deps --force-reinstall torchvision==<x>`, then
+  restart the runtime.
+- **`PIL._typing._Ink` ImportError** — `pip install --force-reinstall Pillow==10.4.0`, then restart.
+- **NumPy 2.x already present (Kaggle)** — do not let extra installs downgrade it;
+  pin it (`pip install nibabel numpy==<current>`).
 
 ---
 

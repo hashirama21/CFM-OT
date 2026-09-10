@@ -1,0 +1,13 @@
+# Reproduces the historical training behavior (Adam, no EMA, auto precision).
+num_epochs: 200
+batch_size: 1
+lr: 1e-4
+val_freq: 5
+num_val_samples: 10
+device: cuda
+checkpoint_dir: checkpoints
+accelerator: auto
+devices: auto
+gradient_accumulation_steps: 8
+optimizer: adam
+scheduler: none

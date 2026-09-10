@@ -1,0 +1,12 @@
+# 2D backbone (e.g. CAMUS echocardiography, BraTS 2D slices).
+spatial_dims: 2
+in_channels: 1
+out_channels: 1
+num_res_blocks: [2, 2, 2, 2, 2]
+num_channels: [32, 64, 128, 224, 256]
+attention_levels: [false, false, false, true, true]
+norm_num_groups: 32
+resblock_updown: true
+num_head_channels: [32, 64, 128, 224, 256]
+transformer_num_layers: 4
+use_flash_attention: true
