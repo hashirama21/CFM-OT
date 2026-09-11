@@ -1,0 +1,8 @@
+# Historical loader: one .pkl holding {split: [{image, mask, class, ...}]}.
+loader: pickle
+pickle_path: ./data/camus/dataset.pkl
+split_train: train
+split_val: valid
+image_norm: minmax_0_1
+mask_norm: minmax_0_1
+norm_scope: global

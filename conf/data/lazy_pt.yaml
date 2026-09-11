@@ -1,0 +1,14 @@
+# Lazy loader: reads one .pt per sample on demand (no giant pickle in RAM).
+# Each .pt is a dict with an image key (target) and a cond key (ControlNet input),
+# indexed by slice_index.csv (file, pid, ...) + splits.csv (patient_id, split).
+loader: lazy_pt
+tensors_dir: ???        # directory holding the .pt files (required)
+slice_index_csv: ???    # CSV with columns: file, pid, [has_tumour, z, ...]
+splits_csv: ???         # CSV with columns: patient_id(or pid), split
+split_train: train
+split_val: val
+split_test: test
+image_key: y            # target image inside each .pt
+cond_key: x             # conditioning image (mapped to "masks")
+norm_scope: sample      # per-sample min-max (compatible with lazy reads)
+modality_dropout: 0.0   # prob. of zeroing 1-2 input channels per train sample

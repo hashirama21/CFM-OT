@@ -23,13 +23,14 @@
 
 ## Requirements
 
-- Python: **3.9 - 3.12**
-- Core pinned stack (from `pyproject.toml`):
-  - `torch==2.5.1`
-  - `flow_matching==1.0.10`
-  - `pytorch-lightning==2.5.6`
-  - `numpy==1.26.4`
-  - `monai_generative==0.2.3`
+- Python: **3.9+**
+- Core stack (version floors in `pyproject.toml`; the platform's existing
+  `torch`/`numpy` are reused rather than reinstalled):
+  - `torch>=2.2`
+  - `flow_matching>=1.0.10`
+  - `pytorch-lightning>=2.2`
+  - `numpy>=1.26`
+  - `monai_generative>=0.2.3`
   - `hydra-core` + `omegaconf` (configuration)
 
 To install from `pyproject.toml`, run:
