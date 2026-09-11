@@ -74,7 +74,9 @@ def _autotune_batch_size(config, datamodule, device, fraction, ceiling, min_bs=1
         return ceiling
     img_shape, mask_shape, n_classes = shapes
     total = torch.cuda.get_device_properties(device).total_memory
-    budget = max(0.05, fraction - 0.05) * total  # stay under the hard cap
+    # Leave headroom below the hard cap for what the single-GPU probe does NOT
+    # measure: DDP gradient buckets + NCCL buffers, EMA shadow, torch.compile.
+    budget = max(0.05, fraction - 0.10) * total
     model_args = config["model_args"]
     path = AffineProbPath(scheduler=CondOTScheduler())
 
@@ -617,6 +619,9 @@ def main(cfg: DictConfig) -> None:
     if bool(tr.get("cudnn_benchmark", True)) and not deterministic:
         torch.backends.cudnn.benchmark = True
 
+    accelerator = tr.get("accelerator", "auto")
+    devices = tr.get("devices", "auto")
+
     # Data and model modules
     datamodule = FlowMatchingDataModule(config)
     model = FlowMatchingLightningModule(config)
@@ -624,7 +629,13 @@ def main(cfg: DictConfig) -> None:
     # GPU memory safety: cap per-process VRAM (keeps >= (1-fraction) free) and,
     # if enabled, auto-tune the per-GPU batch size so a real train step fits the
     # cap on the current hardware (T4 -> small batch, A100/H100/H200 -> large).
-    if torch.cuda.is_available():
+    #
+    # IMPORTANT: with Lightning's subprocess DDP the script is re-executed, so this
+    # block would also run in the *launcher* process and leave a CUDA context on
+    # GPU 0 that starves rank 0's NCCL init. Run it only in real worker processes
+    # (single-device runs, or DDP children which have LOCAL_RANK set).
+    _is_ddp_launcher = _count_devices(accelerator, devices) > 1 and "LOCAL_RANK" not in os.environ
+    if torch.cuda.is_available() and not _is_ddp_launcher:
         frac = float(tr.get("gpu_mem_fraction", 0.95) or 0.95)
         dev = torch.cuda.current_device()
         try:
@@ -654,6 +665,12 @@ def main(cfg: DictConfig) -> None:
                 logger.warning(
                     f"Auto batch-size tuning skipped ({exc}); keeping batch_size={tr['batch_size']}."
                 )
+            finally:
+                # Release probe memory so NCCL/DDP setup and the real model have room.
+                import gc
+
+                gc.collect()
+                torch.cuda.empty_cache()
 
     # Optional model compilation.
     if bool(tr.get("use_compile", False)):
@@ -699,8 +716,6 @@ def main(cfg: DictConfig) -> None:
     else:
         logger.info("No checkpoint found. Starting training from scratch.")
 
-    accelerator = tr.get("accelerator", "auto")
-    devices = tr.get("devices", "auto")
     find_unused = bool(tr.get("ddp_find_unused_parameters", True))
     # "auto"/None -> resolve DDP (with find_unused) for true multi-GPU, else single.
     # "ddp" -> DDP with the configured find_unused flag. Any other value (e.g.
