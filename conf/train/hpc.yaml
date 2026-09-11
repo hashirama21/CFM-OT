@@ -2,10 +2,17 @@
 #   - accelerator/devices "auto" use every visible GPU (respects CUDA_VISIBLE_DEVICES).
 #   - strategy null -> single device or safe multi-GPU DDP (find_unused_parameters).
 #   - precision null -> bf16 on Ampere+/Hopper (A100/H100/H200), fp16 on T4, fp32 on CPU.
-# Tune batch_size / gradient_accumulation_steps to your VRAM.
+#   - gpu_mem_fraction caps VRAM (>= 5% kept free) and auto_batch_size shrinks/grows
+#     the per-GPU batch to fit that budget, so it never OOMs from T4 up to H200.
+# batch_size here is the CEILING; the auto-tuner picks the largest that fits
+# (T4 tunes down to a safe value; A100/H100/H200 use up to this ceiling).
 num_epochs: 50
-batch_size: 16
+batch_size: 32
 lr: 2e-4
+
+gpu_mem_fraction: 0.95
+auto_batch_size: true
+min_batch_size: 1
 
 accelerator: auto
 devices: auto

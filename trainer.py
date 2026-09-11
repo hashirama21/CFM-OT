@@ -41,6 +41,84 @@ def _make_class_balanced_sampler(
     )
 
 
+def _peek_sample_shapes(datamodule):
+    """Return (image_shape, mask_shape|None, num_classes|None) from one sample."""
+    ds = getattr(datamodule, "_lazy_train_ds", None)
+    if ds is not None and len(ds) > 0:
+        s = ds[0]
+        img = tuple(s["images"].shape)
+        mask = tuple(s["masks"].shape) if "masks" in s else None
+        ncls = int(s["classes"].shape[0]) if "classes" in s else None
+        return img, mask, ncls
+    td = getattr(datamodule, "train_data", None)
+    if td is not None and td.get("images") is not None and td["images"].ndim > 1 and td["images"].shape[1] > 0:
+        img = tuple(td["images"].shape[1:])
+        mask = tuple(td["masks"].shape[1:]) if td.get("masks") is not None else None
+        cl = td.get("classes")
+        ncls = int(cl.shape[1]) if cl is not None and getattr(cl, "ndim", 1) == 2 else None
+        return img, mask, ncls
+    return None
+
+
+def _autotune_batch_size(config, datamodule, device, fraction, ceiling, min_bs=1):
+    """Largest power-of-two per-GPU batch (<= ceiling) whose real train step
+    (forward+backward+optimizer.step) stays within ``fraction`` of total VRAM.
+
+    Searches upward from ``min_bs`` so it never starts with an OOM-sized batch;
+    keeps a margin below the hard cap set by set_per_process_memory_fraction.
+    """
+    import gc
+
+    shapes = _peek_sample_shapes(datamodule)
+    if shapes is None:
+        return ceiling
+    img_shape, mask_shape, n_classes = shapes
+    total = torch.cuda.get_device_properties(device).total_memory
+    budget = max(0.05, fraction - 0.05) * total  # stay under the hard cap
+    model_args = config["model_args"]
+    path = AffineProbPath(scheduler=CondOTScheduler())
+
+    def _peak_for(bs: int) -> int:
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        m = build_model(model_args, device=device)
+        m.train()
+        opt = optim.AdamW(m.parameters(), lr=1e-4)
+        imgs = torch.randn((bs,) + img_shape, device=device)
+        masks = torch.randn((bs,) + mask_shape, device=device) if mask_shape else None
+        cond = None
+        if n_classes:
+            cond = torch.zeros(bs, n_classes, device=device)
+            cond[:, 0] = 1.0
+        t = torch.rand(bs, device=device)
+        x0 = torch.randn_like(imgs)
+        info = path.sample(t=t, x_0=x0, x_1=imgs)
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            loss = F.mse_loss(m(x=info.x_t, t=info.t, masks=masks, cond=cond), info.dx_t)
+        loss.backward()
+        opt.step()
+        peak = int(torch.cuda.max_memory_allocated(device))
+        del m, opt, imgs, masks, cond, t, x0, info, loss
+        gc.collect()
+        torch.cuda.empty_cache()
+        return peak
+
+    best, bs = 0, max(1, int(min_bs))
+    while bs <= int(ceiling):
+        try:
+            peak = _peak_for(bs)
+        except torch.cuda.OutOfMemoryError:
+            gc.collect()
+            torch.cuda.empty_cache()
+            break
+        if peak <= budget:
+            best, bs = bs, bs * 2
+        else:
+            break
+    return best if best >= 1 else max(1, int(min_bs))
+
+
 class FlowMatchingDataModule(pl.LightningDataModule):
     """Lightning ``DataModule`` wrapping the existing data helpers."""
 
@@ -543,6 +621,40 @@ def main(cfg: DictConfig) -> None:
     datamodule = FlowMatchingDataModule(config)
     model = FlowMatchingLightningModule(config)
 
+    # GPU memory safety: cap per-process VRAM (keeps >= (1-fraction) free) and,
+    # if enabled, auto-tune the per-GPU batch size so a real train step fits the
+    # cap on the current hardware (T4 -> small batch, A100/H100/H200 -> large).
+    if torch.cuda.is_available():
+        frac = float(tr.get("gpu_mem_fraction", 0.95) or 0.95)
+        dev = torch.cuda.current_device()
+        try:
+            torch.cuda.set_per_process_memory_fraction(frac, dev)
+            logger.info(
+                f"GPU memory cap: {frac:.0%} of device {dev} "
+                f"(>= {(1.0 - frac) * 100:.0f}% VRAM kept free)."
+            )
+        except Exception as exc:
+            logger.warning(f"Could not set GPU memory fraction: {exc}")
+
+        if bool(tr.get("auto_batch_size", False)):
+            try:
+                datamodule.setup("fit")  # needed to peek sample shapes
+                tuned = _autotune_batch_size(
+                    config, datamodule, dev, frac,
+                    ceiling=int(tr["batch_size"]),
+                    min_bs=int(tr.get("min_batch_size", 1)),
+                )
+                if tuned and tuned != int(tr["batch_size"]):
+                    logger.info(
+                        f"Auto batch size: {tr['batch_size']} -> {tuned} per GPU "
+                        f"(fits within {frac:.0%} of VRAM)."
+                    )
+                    tr["batch_size"] = tuned
+            except Exception as exc:
+                logger.warning(
+                    f"Auto batch-size tuning skipped ({exc}); keeping batch_size={tr['batch_size']}."
+                )
+
     # Optional model compilation.
     if bool(tr.get("use_compile", False)):
         try:
@@ -570,14 +682,15 @@ def main(cfg: DictConfig) -> None:
         cbs.append(EMACallback(decay=float(tr.get("ema_decay", 0.999))))
         logger.info(f"EMA enabled (decay={tr.get('ema_decay', 0.999)}).")
 
-    # Precision setup with safe bf16/fp16 detection
-    _bf16_supported = (
-        torch.cuda.is_available() and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
-    )
-    _fp16_supported = torch.cuda.is_available()
-    default_precision = (
-        "bf16-mixed" if _bf16_supported else ("16-mixed" if _fp16_supported else "32-true")
-    )
+    # Precision auto-detection per GPU: bf16 only on Ampere+/Hopper (compute
+    # capability >= 8.0, e.g. A100/H100/H200); fp16 on older GPUs (e.g. T4, which
+    # has no native bf16); fp32 on CPU.
+    if torch.cuda.is_available():
+        major = torch.cuda.get_device_capability(torch.cuda.current_device())[0]
+        bf16_ok = major >= 8 and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+        default_precision = "bf16-mixed" if bf16_ok else "16-mixed"
+    else:
+        default_precision = "32-true"
     precision = tr.get("precision") or default_precision
 
     resume_ckpt = _resolve_resume_checkpoint(tr.get("ckpt_path"), root_ckpt_dir, run_name)

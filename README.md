@@ -147,6 +147,11 @@ The `train/hpc` profile is hardware-agnostic and adapts automatically:
 - `precision=null` → **bf16** on Ampere+/Hopper (A100/H100/H200), **fp16** on T4,
   **fp32** on CPU. TF32 matmul is enabled via `matmul_precision=high`.
 - `use_compile` (torch.compile) and `use_ema` are on; `cudnn_benchmark` autotunes convs.
+- **OOM-safe memory**: `gpu_mem_fraction=0.95` caps per-process VRAM (always keeps
+  ≥5% free), and `auto_batch_size` grows the per-GPU `batch_size` (up to the
+  `batch_size` ceiling) to the largest that fits that budget — measured with a real
+  train step. So the same config trains without OOM on a 15 GB T4 or a 141 GB H200.
+  For less fragmentation, launch with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 
 Example (any node, uses all allocated GPUs):
 ```bash

@@ -117,6 +117,11 @@ class TrainArgs:
     warmup_steps: Optional[int] = None
     min_lr_ratio: float = 0.05
 
+    # GPU memory safety (any hardware: T4 -> H200)
+    gpu_mem_fraction: float = 0.95  # cap per-process VRAM -> keeps >= 5% free
+    auto_batch_size: bool = False   # grow batch_size to the largest that fits the cap
+    min_batch_size: int = 1         # floor for the auto batch-size search
+
     # Trainer knobs
     gradient_accumulation_steps: int = 8
     grad_clip_norm: float = 0.0
