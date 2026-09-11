@@ -29,6 +29,18 @@ logger = get_logger(__name__)
 register_configs()
 
 
+def _make_class_balanced_sampler(
+    class_idxs: torch.Tensor, num_classes: int, power: float = 1.0
+) -> torch.utils.data.WeightedRandomSampler:
+    """Inverse-frequency weighted sampler with optional tempering via ``power``."""
+    counts = torch.bincount(class_idxs, minlength=num_classes).to(dtype=torch.float32)
+    class_weights = counts.clamp_min(1.0).pow(-power)
+    sample_weights = class_weights[class_idxs].to(dtype=torch.double)
+    return torch.utils.data.WeightedRandomSampler(
+        weights=sample_weights, num_samples=len(sample_weights), replacement=True
+    )
+
+
 class FlowMatchingDataModule(pl.LightningDataModule):
     """Lightning ``DataModule`` wrapping the existing data helpers."""
 
@@ -137,7 +149,11 @@ class FlowMatchingDataModule(pl.LightningDataModule):
         """
         dc = self.config["data_args"]
         split = dc.get(split_key, default)
-        files, classes = resolve_split_files(dc["slice_index_csv"], dc["splits_csv"], split)
+        files, classes = resolve_split_files(
+            dc["slice_index_csv"], dc["splits_csv"], split,
+            fraction=float(dc.get("fraction", 1.0)),
+            fraction_seed=int(dc.get("fraction_seed", 42)),
+        )
         num_classes = int(self.config.get("model_args", {}).get("cross_attention_dim", 2) or 2)
         ds = LazyPtDataset(
             files,
@@ -175,16 +191,19 @@ class FlowMatchingDataModule(pl.LightningDataModule):
         elif stage == "validate":
             self._lazy_val_ds, self.val_data = self._make_lazy_dataset("split_val", "val")
 
-    def _lazy_dataloader(self, dataset: LazyPtDataset, shuffle: bool) -> torch.utils.data.DataLoader:
+    def _lazy_dataloader(
+        self, dataset: LazyPtDataset, shuffle: bool, sampler=None
+    ) -> torch.utils.data.DataLoader:
         tr = self.config["train_args"]
         num_workers = int(tr.get("num_workers", 0))
         kwargs = dict(
             batch_size=tr["batch_size"],
             shuffle=shuffle,
+            sampler=sampler,
             num_workers=num_workers,
             pin_memory=tr.get("pin_memory", torch.cuda.is_available()),
             persistent_workers=(num_workers > 0),
-            drop_last=bool(tr.get("drop_last", False)) and shuffle,
+            drop_last=bool(tr.get("drop_last", False)) and (shuffle or sampler is not None),
         )
         if num_workers > 0:
             kwargs["prefetch_factor"] = int(tr.get("prefetch_factor", 4) or 4)
@@ -192,7 +211,22 @@ class FlowMatchingDataModule(pl.LightningDataModule):
 
     def train_dataloader(self) -> torch.utils.data.DataLoader:
         if self.loader == "lazy_pt":
-            return self._lazy_dataloader(self._lazy_train_ds, shuffle=True)
+            tr = self.config["train_args"]
+            sampler = None
+            classes = getattr(self._lazy_train_ds, "classes", None)
+            if bool(tr.get("class_balanced_sampling", False)) and classes is not None:
+                cls = torch.as_tensor(classes, dtype=torch.long)
+                sampler = _make_class_balanced_sampler(
+                    cls, int(self._lazy_train_ds.num_classes),
+                    float(tr.get("class_balance_power", 1.0)),
+                )
+                # Under multi-GPU DDP Lightning replaces custom samplers unless
+                # use_distributed_sampler=False; class balancing then applies only
+                # in single-process runs.
+                logger.info("Using class-balanced sampling for the lazy train loader.")
+            return self._lazy_dataloader(
+                self._lazy_train_ds, shuffle=(sampler is None), sampler=sampler
+            )
 
         tr_args = self.config["train_args"]
         sampler = None
@@ -218,16 +252,8 @@ class FlowMatchingDataModule(pl.LightningDataModule):
                         "expected [N] indices or [N, K] one-hot."
                     )
 
-                # Inverse-frequency weighting with optional tempering via class_balance_power.
-                counts = torch.bincount(class_idxs, minlength=num_classes).to(dtype=torch.float32)
                 power = float(tr_args.get("class_balance_power", 1.0))
-                class_weights = counts.clamp_min(1.0).pow(-power)
-                sample_weights = class_weights[class_idxs].to(dtype=torch.double)
-                sampler = torch.utils.data.WeightedRandomSampler(
-                    weights=sample_weights,
-                    num_samples=len(sample_weights),
-                    replacement=True,
-                )
+                sampler = _make_class_balanced_sampler(class_idxs, num_classes, power)
                 shuffle = False
                 logger.info(
                     f"Using class-balanced sampling with {num_classes} classes and power={power:.3f}."
@@ -432,39 +458,51 @@ def _resolve_resume_checkpoint(
     return max(_candidates, key=os.path.getmtime)
 
 
-def _resolve_strategy(
+def _count_devices(
     accelerator: Union[str, int, list, tuple],
     devices: Union[str, int, list, tuple],
-):
-    """
-    Use DDP only for true multi-GPU execution.
-    For single device (or CPU), keep strategy="auto" to avoid needless overhead.
-    """
+) -> int:
+    """Best-effort count of the devices Lightning will actually use."""
     accelerator_name = str(accelerator).lower()
     gpu_available = torch.cuda.is_available()
     use_gpu = accelerator_name in {"gpu", "cuda"} or (
         accelerator_name == "auto" and gpu_available
     )
-
     if not use_gpu:
-        return "auto"
+        return 1  # CPU / single device
 
+    if isinstance(devices, bool):
+        return torch.cuda.device_count() if devices else 1
     if isinstance(devices, int):
-        return DDPStrategy(find_unused_parameters=True) if devices > 1 else "auto"
+        return max(1, devices)
     if isinstance(devices, (list, tuple)):
-        return DDPStrategy(find_unused_parameters=True) if len(devices) > 1 else "auto"
+        return max(1, len(devices))
     if isinstance(devices, str):
         d = devices.strip().lower()
-        if d == "auto":
-            return DDPStrategy(find_unused_parameters=True) if torch.cuda.device_count() > 1 else "auto"
-        if d == "1":
-            return "auto"
+        if d == "auto" or d == "-1":
+            return max(1, torch.cuda.device_count())
         if d.isdigit():
-            return DDPStrategy(find_unused_parameters=True) if int(d) > 1 else "auto"
-        # Comma-separated ids, e.g. "0,1"
+            return max(1, int(d))
         if "," in d:
-            ids = [x for x in d.split(",") if x.strip() != ""]
-            return DDPStrategy(find_unused_parameters=True) if len(ids) > 1 else "auto"
+            return max(1, len([x for x in d.split(",") if x.strip()]))
+    return max(1, torch.cuda.device_count())
+
+
+def _resolve_strategy(
+    accelerator: Union[str, int, list, tuple],
+    devices: Union[str, int, list, tuple],
+    find_unused_parameters: bool = True,
+):
+    """
+    Resolve the Lightning strategy for the available hardware.
+
+    Use DDP only for true multi-GPU execution; for a single device (or CPU) keep
+    "auto" to avoid needless overhead. ``find_unused_parameters`` is enabled by
+    default so multi-GPU DDP does not crash when a sub-module (e.g. an unused
+    ControlNet branch at some step) receives no gradient.
+    """
+    if _count_devices(accelerator, devices) > 1:
+        return DDPStrategy(find_unused_parameters=find_unused_parameters)
     return "auto"
 
 
@@ -494,6 +532,12 @@ def main(cfg: DictConfig) -> None:
         seed = int(seed)
         pl.seed_everything(seed, workers=True)
         logger.info(f"Using seed={seed} for reproducible training.")
+
+    deterministic = bool(tr.get("deterministic", False))
+    # Autotune convolution algorithms for fixed-shape inputs (disabled when the
+    # run is deterministic, which requires stable algorithms).
+    if bool(tr.get("cudnn_benchmark", True)) and not deterministic:
+        torch.backends.cudnn.benchmark = True
 
     # Data and model modules
     datamodule = FlowMatchingDataModule(config)
@@ -544,14 +588,21 @@ def main(cfg: DictConfig) -> None:
 
     accelerator = tr.get("accelerator", "auto")
     devices = tr.get("devices", "auto")
-    # Allow an explicit strategy override from config (e.g. "dp"/"ddp"); otherwise
-    # only use DDP for true multi-GPU execution.
+    find_unused = bool(tr.get("ddp_find_unused_parameters", True))
+    # "auto"/None -> resolve DDP (with find_unused) for true multi-GPU, else single.
+    # "ddp" -> DDP with the configured find_unused flag. Any other value (e.g.
+    # "dp", "ddp_spawn", "fsdp") is passed straight through to Lightning.
     strategy_cfg = tr.get("strategy", None)
-    if strategy_cfg is not None:
-        strategy = strategy_cfg
+    if strategy_cfg in (None, "auto"):
+        strategy = _resolve_strategy(accelerator, devices, find_unused_parameters=find_unused)
+    elif str(strategy_cfg).lower() == "ddp":
+        strategy = (
+            DDPStrategy(find_unused_parameters=find_unused)
+            if _count_devices(accelerator, devices) > 1
+            else "auto"
+        )
     else:
-        strategy = _resolve_strategy(accelerator=accelerator, devices=devices)
-    deterministic = bool(tr.get("deterministic", False))
+        strategy = strategy_cfg
     logger.info(
         f"Trainer runtime: accelerator={accelerator}, devices={devices}, "
         f"strategy={strategy}, precision={precision}, deterministic={deterministic}."

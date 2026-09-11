@@ -35,6 +35,7 @@ Paper = "https://arxiv.org/abs/2503.00266"
 
 [tool.setuptools]
 py-modules = ["trainer", "inferer"]
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]

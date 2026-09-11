@@ -75,6 +75,10 @@ class DataArgs:
     cond_key: str = "x"
     # Probability of zeroing 1-2 input channels per TRAIN sample (0 disables).
     modality_dropout: float = 0.0
+    # Deterministic patient-level subsampling (1.0 = full split). Applies to the
+    # lazy loader; keep the same value/seed everywhere for aligned evaluation.
+    fraction: float = 1.0
+    fraction_seed: int = 42
 
 
 @dataclass
@@ -90,9 +94,12 @@ class TrainArgs:
     device: str = "cuda"
     accelerator: str = "auto"
     devices: Any = "auto"
-    strategy: Optional[str] = None  # override Lightning strategy from config
-    precision: Optional[str] = None  # None -> auto-detect bf16/fp16/32
-    matmul_precision: Optional[str] = None  # e.g. "high" to enable TF32
+    strategy: Optional[str] = None  # None/"auto" -> resolved per device count
+    # For multi-GPU DDP: guard against sub-modules that receive no gradient.
+    ddp_find_unused_parameters: bool = True
+    precision: Optional[str] = None  # None -> auto-detect bf16/fp16/32 per GPU
+    matmul_precision: Optional[str] = None  # e.g. "high" to enable TF32 (Ampere+)
+    cudnn_benchmark: bool = True  # autotune convolutions for fixed-shape inputs
 
     # Dataloader
     num_workers: int = 0

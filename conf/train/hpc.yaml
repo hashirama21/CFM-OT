@@ -1,0 +1,39 @@
+# Hardware-agnostic performance profile. Adapts to the available hardware:
+#   - accelerator/devices "auto" use every visible GPU (respects CUDA_VISIBLE_DEVICES).
+#   - strategy null -> single device or safe multi-GPU DDP (find_unused_parameters).
+#   - precision null -> bf16 on Ampere+/Hopper (A100/H100/H200), fp16 on T4, fp32 on CPU.
+# Tune batch_size / gradient_accumulation_steps to your VRAM.
+num_epochs: 50
+batch_size: 16
+lr: 2e-4
+
+accelerator: auto
+devices: auto
+strategy: null
+ddp_find_unused_parameters: true
+precision: null
+matmul_precision: high      # TF32 on Ampere+; harmless elsewhere
+cudnn_benchmark: true
+
+num_workers: 8
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 4
+gradient_accumulation_steps: 2
+grad_clip_norm: 1.0
+
+val_freq: 2
+limit_val_batches: 1.0
+num_val_samples: 8
+
+optimizer: adamw
+scheduler: cosine
+weight_decay: 0.0
+warmup_steps: null
+min_lr_ratio: 0.05
+
+use_compile: true
+use_ema: true
+ema_decay: 0.999
+log_every_n_steps: 50
+num_sanity_val_steps: 0

@@ -37,6 +37,10 @@ To install from `pyproject.toml`, run:
 pip install -e .
 ```
 
+> Run the CLI from a repo checkout (or an editable install as above): Hydra loads
+> the `conf/` tree relative to the scripts, so the `motfm-train` / `motfm-infer`
+> entry points resolve the configs from the working tree.
+
 
 ---
 
@@ -95,7 +99,7 @@ conf/
   model/                 # unet2d | unet3d          -> model_args
   conditioning/          # unconditional | class | mask | mask_class (overlays model_args)
   data/                  # pickle | lazy_pt          -> data_args
-  train/                 # default | kaggle_2xt4     -> train_args
+  train/                 # default | hpc            -> train_args
   solver/                # default                   -> solver_args
   infer/                 # default                   -> infer_args
   experiment/            # ready-made compositions (camus_mask_class, mri3d_uncond, brats_synt1ce)
@@ -124,12 +128,33 @@ Available experiments:
 | --- | --- |
 | `camus_mask_class` | 2D CAMUS, mask+class conditioning, `pickle` loader (reproduces the historical `default`) |
 | `mri3d_uncond` | 3D brain MRI, unconditional, `pickle` loader |
-| `brats_synt1ce` | 2D BraTS synT1CE, ControlNet 3-channel input + class, `lazy_pt` loader, EMA/AdamW/cosine/fp16 |
+| `brats_synt1ce` | 2D BraTS synT1CE, ControlNet 3-channel input + class, `lazy_pt` loader, `hpc` profile |
 
 Two dataset loaders are supported via `data_args.loader`:
 - **`pickle`** — the single `.pkl` format described above.
 - **`lazy_pt`** — reads one `.pt` per sample on demand (no giant pickle in RAM),
-  indexed by `slice_index_csv` + `splits_csv`; supports `modality_dropout`.
+  indexed by `slice_index_csv` + `splits_csv`; supports `modality_dropout` and
+  deterministic patient-level subsampling via `data_args.fraction` (< 1.0 for quick
+  runs; use the same `fraction`/`fraction_seed` for aligned evaluation).
+
+### Hardware / HPC
+
+The `train/hpc` profile is hardware-agnostic and adapts automatically:
+- `accelerator=auto`, `devices=auto` use every visible GPU (respects `CUDA_VISIBLE_DEVICES`).
+- `strategy=null` → single device, or safe multi-GPU **DDP** with
+  `find_unused_parameters` (configurable via `train_args.ddp_find_unused_parameters`).
+- `precision=null` → **bf16** on Ampere+/Hopper (A100/H100/H200), **fp16** on T4,
+  **fp32** on CPU. TF32 matmul is enabled via `matmul_precision=high`.
+- `use_compile` (torch.compile) and `use_ema` are on; `cudnn_benchmark` autotunes convs.
+
+Example (any node, uses all allocated GPUs):
+```bash
+python trainer.py experiment=brats_synt1ce data_args.tensors_dir=/path/to/tensors
+```
+
+> Flash attention (`model_args.use_flash_attention`) is left **off** for portability
+> (it requires CUDA + a compatible kernel and fails on e.g. T4). Enable it on
+> A100/H100/H200 with `model_args.use_flash_attention=true`.
 
 ---
 

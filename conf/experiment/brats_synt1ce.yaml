@@ -7,7 +7,7 @@ defaults:
   - override /model@model_args: unet2d
   - override /conditioning@model_args: mask_class
   - override /data@data_args: lazy_pt
-  - override /train@train_args: kaggle_2xt4
+  - override /train@train_args: hpc
   - override /solver@solver_args: default
 
 run_name: brats_synt1ce
@@ -32,6 +32,8 @@ data_args:
   norm_scope: sample
   modality_dropout: 0.5
   class_values: [0, 1]
+  fraction: 1.0          # deterministic patient-level subsample (<1.0 for quick runs)
+  fraction_seed: 42
 
 solver_args:
   method: midpoint

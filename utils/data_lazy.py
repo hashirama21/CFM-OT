@@ -20,6 +20,7 @@ import random
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
@@ -125,17 +126,28 @@ def resolve_split_files(
     slice_index_csv: str,
     splits_csv: str,
     split: str,
+    fraction: float = 1.0,
+    fraction_seed: int = 42,
 ) -> Tuple[List[str], Optional[List[int]]]:
     """Return (files, classes) for a split, ordered as in ``slice_index_csv``.
 
     ``classes`` is derived from the ``has_tumour`` column when present, else None.
+    When ``fraction < 1.0``, a deterministic patient-level subset is selected so
+    that training and downstream evaluation see the *same* samples in the *same*
+    order (this is the single source of truth for subsampling).
     """
     idx = pd.read_csv(slice_index_csv)
     spl = pd.read_csv(splits_csv)
     pid_col = "patient_id" if "patient_id" in spl.columns else spl.columns[0]
-    pids = set(spl.loc[spl["split"] == split, pid_col])
-    sub = idx[idx["pid"].isin(pids)]
+    pids = sorted(set(spl.loc[spl["split"] == split, pid_col]))
+    if fraction < 1.0:
+        rng = np.random.default_rng(fraction_seed)
+        pids = list(rng.permutation(pids))[: max(1, int(len(pids) * fraction))]
+    sub = idx[idx["pid"].isin(set(pids))]  # preserves slice_index.csv order
     files = sub["file"].tolist()
     classes = sub["has_tumour"].astype(int).tolist() if "has_tumour" in sub.columns else None
-    logger.info(f"[LAZY] split '{split}': {len(files)} samples (on-demand .pt reads).")
+    logger.info(
+        f"[LAZY] split '{split}': {len(files)} samples from {len(pids)} patients "
+        f"(fraction={fraction:.0%}, on-demand .pt reads)."
+    )
     return files, classes

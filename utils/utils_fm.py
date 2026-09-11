@@ -1,5 +1,6 @@
 import os
 import json
+from inspect import signature
 
 import torch
 import matplotlib.pyplot as plt
@@ -119,12 +120,18 @@ def build_model(model_config: dict, device: torch.device = None) -> MergedModel:
     # Pop out ControlNet-specific keys, if present.
     cond_embed_channels = mc.pop("conditioning_embedding_num_channels", None)
     cond_in_channels = mc.pop("conditioning_embedding_in_channels", None)
-    # Drop optional keys left at None so the UNet constructor keeps its defaults.
-    if mc.get("dropout_cattn", "unset") is None:
-        mc.pop("dropout_cattn", None)
+    # `dropout_cattn` is a cross-attention arg: keep it out of the shared kwargs and
+    # only forward it to constructors that actually accept it (avoids a ControlNet
+    # TypeError while preserving the UNet's cross-attention dropout).
+    dropout_cattn = mc.pop("dropout_cattn", None)
+
+    def _with_dropout(cls, kwargs):
+        if dropout_cattn is not None and "dropout_cattn" in signature(cls).parameters:
+            return {**kwargs, "dropout_cattn": dropout_cattn}
+        return kwargs
 
     # Build the base UNet by passing all remaining items as kwargs.
-    unet = DiffusionModelUNet(**mc)
+    unet = DiffusionModelUNet(**_with_dropout(DiffusionModelUNet, mc))
 
     controlnet = None
     if mask_conditioning:
@@ -138,7 +145,7 @@ def build_model(model_config: dict, device: torch.device = None) -> MergedModel:
         # `conditioning_embedding_in_channels` sets the number of channels of the
         # conditioning image (1 for a binary mask, 3 for synT1CE multi-modality input).
         controlnet = ControlNet(
-            **mc,
+            **_with_dropout(ControlNet, mc),
             conditioning_embedding_num_channels=cond_embed_channels,
             conditioning_embedding_in_channels=cond_in_channels,
         )

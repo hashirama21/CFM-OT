@@ -1,5 +1,4 @@
 import os
-import yaml
 import torch
 import pickle
 import random
@@ -52,19 +51,6 @@ def class_name_from_map(
     """Resolve class label as a display-safe string."""
     label = class_label_from_map(class_map, idx, default=idx)
     return str(idx if label is None else label)
-
-
-###############################################################################
-# Config Handling
-###############################################################################
-def load_config(config_path: str = "config.yaml"):
-    """
-    Loads a YAML config file from the given path.
-    """
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    logger.info(f"Loaded config file: {config_path}")
-    return config
 
 
 ###############################################################################
