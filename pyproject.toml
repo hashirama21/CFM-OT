@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "motfm"
+name = "cfm-ot"
 version = "0.1.0"
-description = "Medical Optimal Transport Flow Matching for medical image synthesis."
+description = "CFM-OT: Conditional Flow Matching with Optimal Transport for medical image synthesis."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
@@ -28,12 +28,12 @@ dependencies = [
 ]
 
 [project.scripts]
-motfm-train = "trainer:main"
-motfm-infer = "inferer:main"
+cfmot-train = "trainer:main"
+cfmot-infer = "inferer:main"
 
 [project.urls]
-Homepage = "https://github.com/milad1378yz/MOTFM"
-Repository = "https://github.com/milad1378yz/MOTFM"
+Homepage = "https://github.com/hashirama21/CFM-OT"
+Repository = "https://github.com/hashirama21/CFM-OT"
 Paper = "https://arxiv.org/abs/2503.00266"
 
 [tool.setuptools]

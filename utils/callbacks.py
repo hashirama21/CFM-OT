@@ -1,9 +1,9 @@
-"""Training callbacks for MOTFM."""
+"""Training callbacks for CFM-OT."""
 
 import pytorch_lightning as pl
 import torch
 
-from .motfm_logging import get_logger
+from .cfmot_logging import get_logger
 
 logger = get_logger(__name__)
 

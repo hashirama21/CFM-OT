@@ -9,7 +9,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from torch.utils.data import DataLoader, Dataset
-from .motfm_logging import get_logger
+from .cfmot_logging import get_logger
 
 logger = get_logger(__name__)
 

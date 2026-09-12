@@ -16,7 +16,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from utils.config_schema import register_configs
 from utils.general_utils import class_label_from_map, set_global_seed
-from utils.motfm_logging import get_logger
+from utils.cfmot_logging import get_logger
 from utils.utils_fm import sample_batch
 
 from trainer import FlowMatchingDataModule, FlowMatchingLightningModule

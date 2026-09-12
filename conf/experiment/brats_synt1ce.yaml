@@ -21,7 +21,7 @@ model_args:
   conditioning_embedding_num_channels: [16]
 
 data_args:
-  tensors_dir: ${oc.env:MOTFM_TENSORS_DIR,./data/BraTS_2D_Tensors}
+  tensors_dir: ${oc.env:CFMOT_TENSORS_DIR,./data/BraTS_2D_Tensors}
   slice_index_csv: ${data_args.tensors_dir}/slice_index.csv
   splits_csv: ${data_args.tensors_dir}/splits.csv
   split_train: train

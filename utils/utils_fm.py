@@ -10,7 +10,7 @@ from generative.networks.nets import DiffusionModelUNet, ControlNet
 from flow_matching.solver import ODESolver
 
 from .general_utils import class_name_from_map, normalize_zero_to_one, save_image, save_image_3d
-from .motfm_logging import get_logger
+from .cfmot_logging import get_logger
 from tqdm import tqdm
 
 logger = get_logger(__name__)

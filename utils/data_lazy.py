@@ -1,4 +1,4 @@
-"""Lazy per-sample ``.pt`` dataset for MOTFM.
+"""Lazy per-sample ``.pt`` dataset for CFM-OT.
 
 Instead of materializing a single large pickle in RAM, each training/validation
 sample is read from its own ``.pt`` file on demand. This keeps memory (and disk)
@@ -25,7 +25,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from .motfm_logging import get_logger
+from .cfmot_logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -38,7 +38,7 @@ def _minmax(t: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 class LazyPtDataset(Dataset):
-    """Reads each ``.pt`` on demand and returns MOTFM-style batches."""
+    """Reads each ``.pt`` on demand and returns CFM-OT-style batches."""
 
     def __init__(
         self,

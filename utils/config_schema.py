@@ -1,4 +1,4 @@
-"""Structured configuration schema for MOTFM (Hydra + OmegaConf).
+"""Structured configuration schema for CFM-OT (Hydra + OmegaConf).
 
 The root keys (``model_args``/``data_args``/``train_args``/``solver_args``/
 ``infer_args``) are kept identical to the historical YAML layout so that the

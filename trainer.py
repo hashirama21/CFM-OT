@@ -21,7 +21,7 @@ from utils.callbacks import EMACallback
 from utils.config_schema import register_configs
 from utils.data_lazy import LazyPtDataset, resolve_split_files
 from utils.general_utils import create_dataloader, load_and_prepare_data
-from utils.motfm_logging import get_logger
+from utils.cfmot_logging import get_logger
 from utils.utils_fm import build_model, validate_and_save_samples
 
 logger = get_logger(__name__)
