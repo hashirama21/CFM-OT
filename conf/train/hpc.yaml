@@ -22,7 +22,7 @@ precision: null
 matmul_precision: high      # TF32 on Ampere+; harmless elsewhere
 cudnn_benchmark: true
 
-num_workers: 8
+num_workers: 4
 pin_memory: true
 persistent_workers: true
 prefetch_factor: 4
